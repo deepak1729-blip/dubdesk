@@ -49,6 +49,8 @@ const el = {
   verify100Btn:         document.getElementById('verify-100-btn'),
   uploadBtn:            document.getElementById('upload-btn'),
   srtFileInput:         document.getElementById('srt-file-input'),
+  uploadHinglishBtn:    document.getElementById('upload-hinglish-btn'),
+  hinglishSrtFileInput: document.getElementById('hinglish-srt-file-input'),
   youtubeUrl:           document.getElementById('youtube-url'),
   settingsBtn:          document.getElementById('settings-btn'),
   settingsModal:        document.getElementById('settings-modal'),
@@ -314,6 +316,10 @@ function updateButtons() {
   el.verify90Btn.disabled    = !hasSel || !hasKey || state.isTranslating;
   el.verify100Btn.disabled   = !hasSel || !hasKey || state.isTranslating;
   if (el.recordAllBtn) el.recordAllBtn.disabled = !hasSel || state.isRecording;
+  if (el.uploadHinglishBtn) {
+    if (has) el.uploadHinglishBtn.classList.remove('hidden');
+    else el.uploadHinglishBtn.classList.add('hidden');
+  }
 }
 
 /**
@@ -1943,6 +1949,44 @@ function init() {
     reader.readAsText(file);
     e.target.value = ''; // allow re-upload of same file
   });
+
+  // ── Hinglish SRT Upload ──────────────────────────────
+  if (el.uploadHinglishBtn && el.hinglishSrtFileInput) {
+    el.uploadHinglishBtn.addEventListener('click', () => el.hinglishSrtFileInput.click());
+
+    el.hinglishSrtFileInput.addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const hinglishCaptions = parseSRT(ev.target.result);
+        if (!hinglishCaptions.length) {
+          showToast('No captions found in Hinglish SRT', 'error');
+          return;
+        }
+
+        let matched = 0;
+        hinglishCaptions.forEach(hinglishCap => {
+          const matchingEngCap = state.captions.find(c => c.index === hinglishCap.index);
+          // Only overwrite if text exists
+          if (matchingEngCap && hinglishCap.text) {
+            matchingEngCap.hinglish = hinglishCap.text;
+            matched++;
+          }
+        });
+
+        renderTable();
+        if (matched > 0) {
+          showToast(`Loaded ${matched} Hinglish captions`, 'success');
+        } else {
+          showToast('No matching captions found to update', 'error');
+        }
+      };
+      reader.readAsText(file);
+      e.target.value = ''; // allow re-upload of same file
+    });
+  }
 
   // ── YouTube URL ─────────────────────────────
   function handleYTUrl() {
