@@ -1475,7 +1475,18 @@ async function downloadAllAudio() {
     }
   }
 
-  const total = contRecs.length + editIndices.length;
+  // Group consecutive edit recordings for stitching
+  const editGroups = [];
+  for (const idx of editIndices) {
+    const last = editGroups[editGroups.length - 1];
+    if (last && idx === last[last.length - 1] + 1) {
+      last.push(idx);
+    } else {
+      editGroups.push([idx]);
+    }
+  }
+
+  const total = contRecs.length + editGroups.length;
   showToast(`Converting ${total} file${total > 1 ? 's' : ''} to MP3…`, 'info');
 
   // Convert and save continuous recordings
@@ -1491,25 +1502,77 @@ async function downloadAllAudio() {
     }
   }
 
-  // Convert and save individual cell recordings (silence-padded MP3)
-  for (const idx of editIndices) {
-    const cap = state.captions[idx];
-    if (!cap?.audioBlob) continue;
+  // Stitch consecutive edit recordings into timeline-aligned files.
+  // Lone edits stay individual with silence padding.
+  for (const group of editGroups) {
     try {
-      const Ctx        = window.AudioContext || window['webkitAudioContext'];
-      const ctx        = new Ctx();
-      const arrayBuf   = await cap.audioBlob.arrayBuffer();
-      const editBuf    = await ctx.decodeAudioData(arrayBuf.slice(0));
-      const silenceSamples = Math.round(cap.startTime * editBuf.sampleRate);
-      const silenceBuf     = ctx.createBuffer(
-        editBuf.numberOfChannels, Math.max(1, silenceSamples), editBuf.sampleRate
-      );
-      ctx.close();
-      const mp3Blob = encodeMP3([silenceBuf, editBuf]);
-      await saveBlob(mp3Blob, `Track-${cap.index}.mp3`);
+      const Ctx = window.AudioContext || window['webkitAudioContext'];
+      const ctx = new Ctx();
+
+      // Decode all audio buffers in this group
+      const decoded = [];
+      for (const idx of group) {
+        const cap = state.captions[idx];
+        if (!cap?.audioBlob) continue;
+        const arrayBuf = await cap.audioBlob.arrayBuffer();
+        const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
+        decoded.push({ idx, cap, audioBuf });
+      }
+      if (decoded.length === 0) { ctx.close(); continue; }
+
+      const sampleRate  = decoded[0].audioBuf.sampleRate;
+      const numChannels = Math.max(...decoded.map(d => d.audioBuf.numberOfChannels));
+
+      if (decoded.length === 1) {
+        // Single edit — silence-pad from 0 to startTime as before
+        const { cap, audioBuf } = decoded[0];
+        const silenceSamples = Math.round(cap.startTime * sampleRate);
+        const silenceBuf = ctx.createBuffer(numChannels, Math.max(1, silenceSamples), sampleRate);
+        ctx.close();
+        const mp3Blob = encodeMP3([silenceBuf, audioBuf]);
+        await saveBlob(mp3Blob, `Track-${cap.index}.mp3`);
+      } else {
+        // Multiple consecutive edits — stitch on timeline.
+        // Leading silence from first caption's startTime, then each
+        // subsequent caption placed at its startTime relative to the first.
+        const firstStart = decoded[0].cap.startTime;
+        const buffers    = [];
+
+        // Leading silence (from 0 to first caption start)
+        const leadSamples = Math.round(firstStart * sampleRate);
+        if (leadSamples > 0) {
+          buffers.push(ctx.createBuffer(numChannels, leadSamples, sampleRate));
+        }
+
+        for (let i = 0; i < decoded.length; i++) {
+          const { cap, audioBuf } = decoded[i];
+
+          if (i > 0) {
+            // Insert silence gap between previous caption's end and this caption's start
+            const prevEnd  = decoded[i - 1].cap.endTime;
+            const gapSec   = cap.startTime - prevEnd;
+            const gapSamples = Math.round(gapSec * sampleRate);
+            if (gapSamples > 0) {
+              buffers.push(ctx.createBuffer(numChannels, gapSamples, sampleRate));
+            }
+          }
+          buffers.push(audioBuf);
+        }
+
+        ctx.close();
+        const mp3Blob  = encodeMP3(buffers);
+        const startNum = decoded[0].cap.index;
+        const endNum   = decoded[decoded.length - 1].cap.index;
+        await saveBlob(mp3Blob, `Track-${startNum}-${endNum}.mp3`);
+      }
     } catch (err) {
-      console.error('Failed to prepare edit audio for idx', idx, err);
-      showToast(`Failed to prepare Track-${cap.index}: ` + err.message, 'error');
+      const startCap = state.captions[group[0]];
+      const endCap   = state.captions[group[group.length - 1]];
+      const label    = group.length === 1
+        ? `Track-${startCap.index}`
+        : `Track-${startCap.index}-${endCap.index}`;
+      console.error('Failed to prepare edit audio for', label, err);
+      showToast(`Failed to prepare ${label}: ` + err.message, 'error');
     }
   }
 
@@ -1978,6 +2041,18 @@ function init() {
     // Don't intercept when focus is inside an input/textarea
     const tag = document.activeElement?.tagName;
     if (tag === 'TEXTAREA' || tag === 'INPUT') return;
+
+    if ((e.key === 'r' || e.key === 'R') && state.selectedRow !== null && !state.isRecording) {
+      e.preventDefault();
+      startRecordingFrom(state.selectedRow, true);
+      return;
+    }
+
+    if ((e.key === 'e' || e.key === 'E') && state.selectedRow !== null && !state.isRecording) {
+      e.preventDefault();
+      startRecordingFrom(state.selectedRow, false);
+      return;
+    }
 
     if (e.key === 'ArrowDown' && state.selectedRow !== null) {
       e.preventDefault();
