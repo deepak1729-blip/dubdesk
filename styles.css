@@ -432,6 +432,13 @@ body {
   border-right: none;
 }
 
+.avg-pct {
+  font-weight: 400;
+  opacity: 0.8;
+  margin-left: 2px;
+  text-transform: none;
+}
+
 /* ==================== CAPTION TABLE ==================== */
 
 .caption-table {
