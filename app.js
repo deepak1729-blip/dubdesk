@@ -691,6 +691,8 @@ async function retranslateSelected(mode) {
     }
     const pctEl = el.captionTable.querySelector(`.length-pct[data-pct-index="${idx}"]`);
     if (pctEl) pctEl.textContent = computeLengthPct(cap) + '%';
+    const row = rowEl(idx);
+    if (row) applyRowClass(row, cap);
 
     showToast(`Re-translated (${mode}%)`, 'success');
 
