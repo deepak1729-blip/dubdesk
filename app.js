@@ -306,6 +306,7 @@ function updateProgress() {
   const pct = total > 0 ? Math.round((done / total) * 100) : 0;
   el.verifyProgress100.style.width = `${pct}%`;
   el.verifyProgress90.style.width  = '0%';
+  updateAvgUtility();
 }
 
 function updateButtons() {
@@ -331,6 +332,30 @@ function computeLengthPct(cap) {
   const transLen = (cap.hinglish || '').trim().length;
   if (origLen === 0) return 0;
   return Math.round((transLen / origLen) * 100);
+}
+
+function updateAvgUtility() {
+  const avgPctEl = document.getElementById('avg-utility-pct');
+  if (!avgPctEl) return;
+  if (!state.captions || state.captions.length === 0) {
+    avgPctEl.textContent = '';
+    return;
+  }
+  let sum = 0;
+  let count = 0;
+  state.captions.forEach(cap => {
+    const pct = computeLengthPct(cap);
+    if (pct > 0) {
+      sum += pct;
+      count++;
+    }
+  });
+  if (count === 0) {
+    avgPctEl.textContent = '';
+  } else {
+    const avg = Math.round(sum / count);
+    avgPctEl.textContent = `(Avg: ${avg}%)`;
+  }
 }
 
 function escHtml(str) {
@@ -539,6 +564,7 @@ async function translateAll() {
   el.translateBtn.textContent = 'Translate';
   state.isTranslating = false;
   updateButtons();
+  updateAvgUtility();
 
   setTimeout(() => el.translateProgress.classList.add('hidden'), 600);
   if (done > 0) showToast(`Translated ${done} caption${done !== 1 ? 's' : ''}`, 'success');
@@ -676,6 +702,7 @@ async function retranslateSelected(mode) {
     button.textContent = originalText;
     state.isTranslating = false;
     updateButtons();
+    updateAvgUtility();
   }
 }
 
