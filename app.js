@@ -353,7 +353,7 @@ function updateAvgUtility() {
   if (count === 0) {
     avgPctEl.textContent = '';
   } else {
-    const avg = Math.round(sum / count);
+    const avg = (sum / count).toFixed(1);
     avgPctEl.textContent = `(Avg: ${avg}%)`;
   }
 }
