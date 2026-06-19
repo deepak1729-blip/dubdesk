@@ -77,6 +77,29 @@ const el = {
   iframeWrapper:        document.getElementById('youtube-iframe-wrapper'),
   toast:                document.getElementById('toast'),
   flowTeleprompter:     document.getElementById('flow-teleprompter'),
+  timelinePlayBtn:      document.getElementById('timeline-play-btn'),
+};
+
+// ─────────────────────────────────────────────
+// DUB TIMELINE — runtime state
+// ─────────────────────────────────────────────
+
+const tl = {
+  viewport: null, canvas: null, ctx: null,
+  playheadEl: null, emptyEl: null, scrollbar: null, thumb: null,
+
+  dpr: 1, cssW: 0, cssH: 0,
+
+  duration: 1,        // total timeline seconds (max of video duration & last caption end)
+  videoDuration: 0,   // from the YouTube player, once known
+  pxPerSec: 0,        // current zoom
+  minPxPerSec: 1,     // fit-whole-video zoom (can't zoom out past this)
+  maxPxPerSec: 400,   // max zoom-in
+  scrollSec: 0,       // time at the left edge of the viewport
+  userZoomed: false,  // true once the user wheels in (so we stop auto-fitting)
+
+  dragging: false, dragMoved: false, dragStartX: 0, dragStartScroll: 0,
+  rafId: null,
 };
 
 // ─────────────────────────────────────────────
@@ -297,6 +320,7 @@ function selectRow(idx) {
   const curr = rowEl(idx);
   if (curr) curr.classList.add('selected');
   updateButtons();
+  renderTimeline();
 }
 
 function updateProgress() {
@@ -341,20 +365,17 @@ function updateAvgUtility() {
     avgPctEl.textContent = '';
     return;
   }
-  let sum = 0;
-  let count = 0;
+  let totalOrigLen = 0;
+  let totalTransLen = 0;
   state.captions.forEach(cap => {
-    const pct = computeLengthPct(cap);
-    if (pct > 0) {
-      sum += pct;
-      count++;
-    }
+    totalOrigLen  += (cap.text     || '').trim().length;
+    totalTransLen += (cap.hinglish || '').trim().length;
   });
-  if (count === 0) {
+  if (totalOrigLen === 0 || totalTransLen === 0) {
     avgPctEl.textContent = '';
   } else {
-    const avg = (sum / count).toFixed(1);
-    avgPctEl.textContent = `(Avg: ${avg}%)`;
+    const pct = ((totalTransLen / totalOrigLen) * 100).toFixed(1);
+    avgPctEl.textContent = `(Avg: ${pct}%)`;
   }
 }
 
@@ -431,10 +452,10 @@ function createPlayer(videoId) {
   });
 }
 
-function seekVideo(seconds) {
+function seekVideo(seconds, play = true) {
   if (ytPlayer && typeof ytPlayer.seekTo === 'function') {
     ytPlayer.seekTo(seconds, true);
-    ytPlayer.playVideo();
+    if (play) ytPlayer.playVideo();
   } else {
     pendingSeek = seconds;
   }
@@ -447,18 +468,68 @@ function playSegment(startTime, endTime) {
     clearTimeout(_segmentStopTimer);
     _segmentStopTimer = null;
   }
-  seekVideo(startTime);
+
   const durationMs = Math.max(0, (endTime - startTime) * 1000);
-  _segmentStopTimer = setTimeout(() => {
-    pauseVideo();
-    _segmentStopTimer = null;
-  }, durationMs);
+
+  // Seek first, then poll until the player is actually near startTime before
+  // starting the stop timer. This compensates for seekTo() being asynchronous —
+  // without the wait the timer fires too early on the first play of each cell.
+  seekVideo(startTime);
+
+  const SEEK_POLL_MS  = 50;   // how often to check the playhead position
+  const SEEK_TIMEOUT_MS = 2000; // give up waiting after this long and just use durationMs
+
+  const seekStart = Date.now();
+
+  function waitForSeekThenStop() {
+    const elapsed = Date.now() - seekStart;
+    const currentTime = ytPlayer && typeof ytPlayer.getCurrentTime === 'function'
+      ? ytPlayer.getCurrentTime()
+      : null;
+
+    const seekComplete = currentTime !== null && Math.abs(currentTime - startTime) < 0.3;
+    const timedOut     = elapsed >= SEEK_TIMEOUT_MS;
+
+    if (seekComplete || timedOut) {
+      // Recompute remaining time from actual playhead position so we stop
+      // at endTime regardless of how long the seek took.
+      const actualCurrent = seekComplete ? currentTime : startTime;
+      const remaining = Math.max(0, (endTime - actualCurrent) * 1000);
+      _segmentStopTimer = setTimeout(() => {
+        pauseVideo();
+        _segmentStopTimer = null;
+      }, remaining);
+    } else {
+      _segmentStopTimer = setTimeout(waitForSeekThenStop, SEEK_POLL_MS);
+    }
+  }
+
+  _segmentStopTimer = setTimeout(waitForSeekThenStop, SEEK_POLL_MS);
 }
 
 function pauseVideo() {
   if (ytPlayer && typeof ytPlayer.pauseVideo === 'function') {
     ytPlayer.pauseVideo();
   }
+}
+
+function toggleVideoPlayback() {
+  if (!ytPlayer || typeof ytPlayer.getPlayerState !== 'function') return;
+  const playing = ytPlayer.getPlayerState() === 1;
+  if (playing) {
+    ytPlayer.pauseVideo();
+  } else {
+    ytPlayer.playVideo();
+  }
+}
+
+function syncTimelinePlayBtn() {
+  if (!el.timelinePlayBtn) return;
+  const playing = ytPlayer &&
+    typeof ytPlayer.getPlayerState === 'function' &&
+    ytPlayer.getPlayerState() === 1;
+  el.timelinePlayBtn.textContent = playing ? '⏸' : '▶';
+  el.timelinePlayBtn.classList.toggle('playing', !!playing);
 }
 
 // ─────────────────────────────────────────────
@@ -713,9 +784,9 @@ async function retranslateSelected(mode) {
 // ─────────────────────────────────────────────
 
 function saveDraft() {
-  // Strip in-memory audio fields — Blobs can't be JSON-stringified anyway
+  // Strip in-memory audio fields — Blobs / typed arrays can't be JSON-stringified
   const captions = state.captions.map(c => {
-    const { audioBlob, audioUrl, audioMime, ...rest } = c;
+    const { audioBlob, audioUrl, audioMime, _wave, ...rest } = c;
     return rest;
   });
   const draft = {
@@ -745,6 +816,7 @@ function loadDraft() {
 
     if (state.captions.length) {
       renderTable();
+      fitTimeline();
       showToast(`Draft loaded (${state.captions.length} captions)`, 'success');
     }
   } catch (e) {
@@ -878,14 +950,8 @@ async function startRecordingFrom(idx, continuous = false) {
       if (ri !== -1) {
         URL.revokeObjectURL(existing.url);
         state.continuousRecordings.splice(ri, 1);
+        renderTimeline();
       }
-    }
-  } else {
-    if (cap.audioUrl) {
-      const ok = window.confirm(
-        `Overwrite existing recording for caption #${cap.index}?`
-      );
-      if (!ok) return;
     }
   }
 
@@ -952,9 +1018,8 @@ function startContinuousRecorder(startIdx) {
     const endIdx = state.continuousRecEndIdx ?? startIdx;
 
     // Store this session in the recordings array
-    state.continuousRecordings.push({
-      blob, mime, url, startIdx, endIdx
-    });
+    const rec = { blob, mime, url, startIdx, endIdx };
+    state.continuousRecordings.push(rec);
 
     // Clear any old per-cell recordings that this continuous take supersedes
     for (let i = startIdx; i <= endIdx; i++) {
@@ -964,9 +1029,14 @@ function startContinuousRecorder(startIdx) {
         c.audioBlob = null;
         c.audioMime = null;
         c.audioUrl  = null;
+        c._wave     = null;
       }
       updateRowRecordUI(i);
     }
+
+    // Fill the timeline pills immediately, then draw waveforms once decoded.
+    renderTimeline();
+    buildWaveForContinuous(rec);
   };
   recorder.start();
   state.mediaRecorder = recorder;
@@ -1463,156 +1533,146 @@ function audioExt(mime) {
 }
 
 /**
- * Download every recorded audio file as MP3 — continuous recordings are
- * decoded and re-encoded; individual edits are silence-padded then encoded.
- * Uses the File System Access API (showDirectoryPicker) so the user can
- * choose the destination folder directly. Falls back to normal <a> downloads
- * in browsers that don't support it.
+ * "All Audio" download — render the ENTIRE dub timeline, exactly as it sits
+ * right now, into a single MP3 spanning 0:00 → end of timeline.
+ *
+ * Every recording is mixed in at its real timeline position with silence
+ * filling the gaps:
+ *   • Continuous takes start at captions[startIdx].startTime and play straight
+ *     through (they were recorded continuously, gaps included).
+ *   • Per-cell edit recordings are placed at their caption's startTime.
+ * The result is a single file that sounds like playing the timeline top to
+ * bottom — start to end — as recorded up to this moment.
  */
 async function downloadAllAudio() {
   const contRecs    = state.continuousRecordings;
   const editIndices = [];
-  state.captions.forEach((cap, idx) => { if (cap.audioUrl) editIndices.push(idx); });
+  state.captions.forEach((cap, idx) => { if (cap.audioBlob) editIndices.push(idx); });
 
   if (contRecs.length === 0 && editIndices.length === 0) {
     showToast('No recordings to download', 'info');
     return;
   }
 
-  // Try to let the user pick a destination folder
-  let dirHandle = null;
+  const Ctx = window.AudioContext || window['webkitAudioContext'];
+  if (!Ctx) {
+    showToast('Web Audio API not supported in this browser', 'error');
+    return;
+  }
+
+  showToast('Rendering full dub timeline…', 'info');
+
+  let mp3Blob;
+  try {
+    mp3Blob = await renderTimelineMixdown(Ctx);
+  } catch (err) {
+    console.error('Timeline mixdown failed', err);
+    showToast('Failed to render timeline: ' + err.message, 'error');
+    return;
+  }
+  if (!mp3Blob) {
+    showToast('Nothing to render — no audio on the timeline', 'info');
+    return;
+  }
+
+  const filename = 'DubTimeline.mp3';
+
+  // Prefer the directory picker so the user controls the destination; fall
+  // back to a normal <a> download where the API isn't available.
   if (typeof window.showDirectoryPicker === 'function') {
     try {
-      dirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-    } catch (err) {
-      if (err.name === 'AbortError') return; // user cancelled — don't proceed
-      // Other errors: fall through to <a> download fallback
-      console.warn('showDirectoryPicker failed, falling back to download links', err);
-    }
-  }
-
-  /**
-   * Save a Blob either directly into the chosen folder or via <a> download.
-   */
-  async function saveBlob(blob, filename) {
-    if (dirHandle) {
+      const dirHandle  = await window.showDirectoryPicker({ mode: 'readwrite' });
       const fileHandle = await dirHandle.getFileHandle(filename, { create: true });
       const writable   = await fileHandle.createWritable();
-      await writable.write(blob);
+      await writable.write(mp3Blob);
       await writable.close();
-    } else {
-      const url = URL.createObjectURL(blob);
-      const a   = document.createElement('a');
-      a.href     = url;
-      a.download = filename;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 2000);
-    }
-  }
-
-  // Group consecutive edit recordings for stitching
-  const editGroups = [];
-  for (const idx of editIndices) {
-    const last = editGroups[editGroups.length - 1];
-    if (last && idx === last[last.length - 1] + 1) {
-      last.push(idx);
-    } else {
-      editGroups.push([idx]);
-    }
-  }
-
-  const total = contRecs.length + editGroups.length;
-  showToast(`Converting ${total} file${total > 1 ? 's' : ''} to MP3…`, 'info');
-
-  // Convert and save continuous recordings
-  for (const rec of contRecs) {
-    try {
-      const mp3Blob  = await blobToMP3Blob(rec.blob);
-      const startNum = state.captions[rec.startIdx].index;
-      const endNum   = state.captions[rec.endIdx].index;
-      await saveBlob(mp3Blob, `Track-${startNum}-${endNum}.mp3`);
+      showToast(`Saved dub timeline to "${dirHandle.name}" folder`, 'success');
+      return;
     } catch (err) {
-      console.error('MP3 conversion failed for continuous rec', err);
-      showToast('Failed to convert a continuous recording: ' + err.message, 'error');
+      if (err.name === 'AbortError') return; // user cancelled — don't proceed
+      console.warn('showDirectoryPicker failed, falling back to download link', err);
     }
   }
 
-  // Stitch consecutive edit recordings into timeline-aligned files.
-  // Lone edits stay individual with silence padding.
-  for (const group of editGroups) {
-    try {
-      const Ctx = window.AudioContext || window['webkitAudioContext'];
-      const ctx = new Ctx();
+  const url = URL.createObjectURL(mp3Blob);
+  const a   = document.createElement('a');
+  a.href     = url;
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+  showToast('Dub timeline downloaded', 'success');
+}
 
-      // Decode all audio buffers in this group
-      const decoded = [];
-      for (const idx of group) {
-        const cap = state.captions[idx];
-        if (!cap?.audioBlob) continue;
-        const arrayBuf = await cap.audioBlob.arrayBuffer();
-        const audioBuf = await ctx.decodeAudioData(arrayBuf.slice(0));
-        decoded.push({ idx, cap, audioBuf });
-      }
-      if (decoded.length === 0) { ctx.close(); continue; }
+/**
+ * Decode every recording, place each at its timeline offset, and mix them
+ * down into one MP3 covering 0:00 → end of timeline. Overlapping audio is
+ * summed (with clipping protection on encode), so re-records that bleed past
+ * a caption boundary still come through cleanly.
+ *
+ * @returns {Promise<Blob|null>} the MP3 blob, or null if there's no audio.
+ */
+async function renderTimelineMixdown(Ctx) {
+  const ctx = new Ctx();
+  try {
+    // ── 1. Decode each placed recording into { buf, startTime } ─────────
+    const placed = [];
 
-      const sampleRate  = decoded[0].audioBuf.sampleRate;
-      const numChannels = Math.max(...decoded.map(d => d.audioBuf.numberOfChannels));
-
-      if (decoded.length === 1) {
-        // Single edit — silence-pad from 0 to startTime as before
-        const { cap, audioBuf } = decoded[0];
-        const silenceSamples = Math.round(cap.startTime * sampleRate);
-        const silenceBuf = ctx.createBuffer(numChannels, Math.max(1, silenceSamples), sampleRate);
-        ctx.close();
-        const mp3Blob = encodeMP3([silenceBuf, audioBuf]);
-        await saveBlob(mp3Blob, `Track-${cap.index}.mp3`);
-      } else {
-        // Multiple consecutive edits — stitch on timeline.
-        // Leading silence from first caption's startTime, then each
-        // subsequent caption placed at its startTime relative to the first.
-        const firstStart = decoded[0].cap.startTime;
-        const buffers    = [];
-
-        // Leading silence (from 0 to first caption start)
-        const leadSamples = Math.round(firstStart * sampleRate);
-        if (leadSamples > 0) {
-          buffers.push(ctx.createBuffer(numChannels, leadSamples, sampleRate));
-        }
-
-        for (let i = 0; i < decoded.length; i++) {
-          const { cap, audioBuf } = decoded[i];
-
-          if (i > 0) {
-            // Insert silence gap between previous caption's end and this caption's start
-            const prevEnd  = decoded[i - 1].cap.endTime;
-            const gapSec   = cap.startTime - prevEnd;
-            const gapSamples = Math.round(gapSec * sampleRate);
-            if (gapSamples > 0) {
-              buffers.push(ctx.createBuffer(numChannels, gapSamples, sampleRate));
-            }
-          }
-          buffers.push(audioBuf);
-        }
-
-        ctx.close();
-        const mp3Blob  = encodeMP3(buffers);
-        const startNum = decoded[0].cap.index;
-        const endNum   = decoded[decoded.length - 1].cap.index;
-        await saveBlob(mp3Blob, `Track-${startNum}-${endNum}.mp3`);
-      }
-    } catch (err) {
-      const startCap = state.captions[group[0]];
-      const endCap   = state.captions[group[group.length - 1]];
-      const label    = group.length === 1
-        ? `Track-${startCap.index}`
-        : `Track-${startCap.index}-${endCap.index}`;
-      console.error('Failed to prepare edit audio for', label, err);
-      showToast(`Failed to prepare ${label}: ` + err.message, 'error');
+    // Continuous takes start at their first caption's startTime and run straight.
+    for (const rec of state.continuousRecordings) {
+      if (!rec.blob) continue;
+      const arrayBuf = await rec.blob.arrayBuffer();
+      const buf      = await ctx.decodeAudioData(arrayBuf.slice(0));
+      placed.push({ buf, startTime: state.captions[rec.startIdx].startTime });
     }
-  }
 
-  const dest = dirHandle ? `"${dirHandle.name}" folder` : 'your Downloads folder';
-  showToast(`Saved ${total} MP3 file${total > 1 ? 's' : ''} to ${dest}`, 'success');
+    // Per-cell edits placed at their caption's startTime.
+    for (const cap of state.captions) {
+      if (!cap.audioBlob) continue;
+      const arrayBuf = await cap.audioBlob.arrayBuffer();
+      const buf      = await ctx.decodeAudioData(arrayBuf.slice(0));
+      placed.push({ buf, startTime: cap.startTime });
+    }
+
+    if (placed.length === 0) return null;
+
+    // ── 2. Figure out the mixdown geometry ──────────────────────────────
+    const sampleRate  = placed[0].buf.sampleRate;
+    const numChannels = Math.min(2, Math.max(...placed.map(p => p.buf.numberOfChannels)));
+
+    // End of the timeline: the furthest of the last caption end, the video
+    // duration, and the actual tail of every placed recording.
+    let endSec = 0;
+    const lastCap = state.captions[state.captions.length - 1];
+    if (lastCap) endSec = Math.max(endSec, lastCap.endTime);
+    if (tl.videoDuration > 0) endSec = Math.max(endSec, tl.videoDuration);
+    for (const p of placed) {
+      endSec = Math.max(endSec, p.startTime + p.buf.duration);
+    }
+
+    const totalFrames = Math.max(1, Math.ceil(endSec * sampleRate));
+
+    // ── 3. Mix every recording into the master buffer at its offset ─────
+    const master = [];
+    for (let ch = 0; ch < numChannels; ch++) master.push(new Float32Array(totalFrames));
+
+    for (const { buf, startTime } of placed) {
+      const offset = Math.round(startTime * sampleRate);
+      for (let ch = 0; ch < numChannels; ch++) {
+        const src = buf.getChannelData(ch < buf.numberOfChannels ? ch : buf.numberOfChannels - 1);
+        const dst = master[ch];
+        const n   = Math.min(src.length, totalFrames - offset);
+        for (let i = 0; i < n; i++) dst[offset + i] += src[i];
+      }
+    }
+
+    // ── 4. Wrap the mixed channels in an AudioBuffer and encode ─────────
+    const outBuf = ctx.createBuffer(numChannels, totalFrames, sampleRate);
+    for (let ch = 0; ch < numChannels; ch++) outBuf.getChannelData(ch).set(master[ch]);
+
+    return encodeMP3([outBuf]);
+  } finally {
+    ctx.close();
+  }
 }
 
 /**
@@ -1748,7 +1808,9 @@ async function processSingleCellRecording(blob, mime, cap, idx, preRollMs, speed
     cap.audioBlob = blob;
     cap.audioMime = mime;
     cap.audioUrl  = URL.createObjectURL(blob);
+    cap._wave     = null;
     updateRowRecordUI(idx);
+    renderTimeline();
     return;
   }
 
@@ -1803,7 +1865,12 @@ async function processSingleCellRecording(blob, mime, cap, idx, preRollMs, speed
   cap.audioBlob = mp3Blob;
   cap.audioMime = 'audio/mp3';
   cap.audioUrl  = URL.createObjectURL(mp3Blob);
+  cap._wave     = null;
   updateRowRecordUI(idx);
+
+  // Fill the timeline pill immediately, then draw the waveform once decoded.
+  renderTimeline();
+  buildWaveForCaption(idx);
 
   const msg = needSpeed
     ? `Recording saved (sped up ${speedFactor.toFixed(1)}x)`
@@ -1944,6 +2011,453 @@ function toggleListen(idx) {
 }
 
 // ─────────────────────────────────────────────
+// DUB TIMELINE — waveforms + per-caption pills
+// ─────────────────────────────────────────────
+
+/** Wire up the timeline canvas, listeners and the per-frame playhead loop. */
+function initTimeline() {
+  tl.viewport   = document.getElementById('timeline-viewport');
+  tl.canvas     = document.getElementById('timeline-canvas');
+  tl.playheadEl = document.getElementById('timeline-playhead');
+  tl.emptyEl    = document.getElementById('timeline-empty');
+  tl.scrollbar  = document.getElementById('timeline-scrollbar');
+  tl.thumb      = document.getElementById('timeline-scrollbar-thumb');
+  if (!tl.canvas) return;
+  tl.ctx = tl.canvas.getContext('2d');
+
+  // Wheel: zoom (centered on cursor); shift / horizontal wheel: pan.
+  tl.viewport.addEventListener('wheel', onTimelineWheel, { passive: false });
+
+  // Drag to pan; a click that doesn't move is a seek/select.
+  tl.viewport.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    tl.dragging = true;
+    tl.dragMoved = false;
+    tl.dragStartX = e.clientX;
+    tl.dragStartScroll = tl.scrollSec;
+  });
+  window.addEventListener('mousemove', e => {
+    if (!tl.dragging) return;
+    const dx = e.clientX - tl.dragStartX;
+    if (Math.abs(dx) > 4) tl.dragMoved = true;
+    tl.scrollSec = tl.dragStartScroll - dx / tl.pxPerSec;
+    clampTimelineScroll();
+    renderTimeline();
+  });
+  window.addEventListener('mouseup', e => {
+    if (!tl.dragging) return;
+    tl.dragging = false;
+    if (!tl.dragMoved) {
+      const rect = tl.viewport.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      if (x >= 0 && x <= tl.cssW) onTimelineClick(x);
+    }
+  });
+
+  // Scrollbar thumb drag.
+  tl.thumb.addEventListener('mousedown', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    const track = tl.scrollbar;
+    const tw = track.clientWidth;
+    const startX = e.clientX;
+    const startScroll = tl.scrollSec;
+    const move = ev => {
+      const dx = ev.clientX - startX;
+      tl.scrollSec = startScroll + (dx / Math.max(1, tw)) * tl.duration;
+      clampTimelineScroll();
+      renderTimeline();
+    };
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+
+  if (window.ResizeObserver) {
+    new ResizeObserver(() => resizeTimeline()).observe(tl.viewport);
+  } else {
+    window.addEventListener('resize', resizeTimeline);
+  }
+
+  resizeTimeline();
+  timelineTick();
+}
+
+/** Total timeline length: whichever is longer — the video or the last caption. */
+function timelineDuration() {
+  let last = 0;
+  for (const c of state.captions) if (c.endTime > last) last = c.endTime;
+  return Math.max(tl.videoDuration || 0, last, 1);
+}
+
+function recomputeTimelineBounds() {
+  tl.duration    = timelineDuration();
+  tl.minPxPerSec = tl.cssW > 0 ? tl.cssW / tl.duration : 1;
+  if (tl.pxPerSec < tl.minPxPerSec) tl.pxPerSec = tl.minPxPerSec;
+  if (tl.pxPerSec > tl.maxPxPerSec) tl.pxPerSec = tl.maxPxPerSec;
+}
+
+/** Reset zoom to fit the whole timeline and scroll back to 0. */
+function fitTimeline() {
+  recomputeTimelineBounds();
+  tl.pxPerSec  = tl.minPxPerSec;
+  tl.scrollSec = 0;
+  tl.userZoomed = false;
+  renderTimeline();
+}
+
+function clampTimelineScroll() {
+  const viewSec = tl.cssW / tl.pxPerSec;
+  const maxScroll = Math.max(0, tl.duration - viewSec);
+  if (tl.scrollSec < 0) tl.scrollSec = 0;
+  if (tl.scrollSec > maxScroll) tl.scrollSec = maxScroll;
+}
+
+function resizeTimeline() {
+  if (!tl.viewport || !tl.ctx) return;
+  const rect = tl.viewport.getBoundingClientRect();
+  tl.cssW = rect.width;
+  tl.cssH = rect.height;
+  tl.dpr  = window.devicePixelRatio || 1;
+  tl.canvas.width  = Math.max(1, Math.round(tl.cssW * tl.dpr));
+  tl.canvas.height = Math.max(1, Math.round(tl.cssH * tl.dpr));
+  tl.canvas.style.width  = tl.cssW + 'px';
+  tl.canvas.style.height = tl.cssH + 'px';
+  tl.ctx.setTransform(tl.dpr, 0, 0, tl.dpr, 0, 0);
+  recomputeTimelineBounds();
+  if (!tl.userZoomed) tl.pxPerSec = tl.minPxPerSec;
+  clampTimelineScroll();
+  renderTimeline();
+}
+
+function onTimelineWheel(e) {
+  e.preventDefault();
+  if (!tl.duration || !tl.pxPerSec) return;
+
+  // Pan when shift is held or the gesture is mostly horizontal.
+  if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+    const dx = e.shiftKey ? e.deltaY : e.deltaX;
+    tl.scrollSec += dx / tl.pxPerSec;
+    clampTimelineScroll();
+    renderTimeline();
+    return;
+  }
+
+  const rect = tl.viewport.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const tUnderCursor = tl.scrollSec + x / tl.pxPerSec;
+
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  let np = tl.pxPerSec * factor;
+  np = Math.max(tl.minPxPerSec, Math.min(tl.maxPxPerSec, np));
+  tl.pxPerSec = np;
+  tl.userZoomed = np > tl.minPxPerSec + 1e-6;
+
+  // Keep the time under the cursor fixed in place.
+  tl.scrollSec = tUnderCursor - x / np;
+  clampTimelineScroll();
+  renderTimeline();
+}
+
+/** A click (not a drag) on the timeline: seek + select the caption under it. */
+function onTimelineClick(x) {
+  if (!state.captions.length) return;
+  const t = tl.scrollSec + x / tl.pxPerSec;
+  const idx = state.captions.findIndex(c => t >= c.startTime && t <= c.endTime);
+  if (idx !== -1) {
+    selectRow(idx);
+    scrollRowToCenter(idx);
+    seekVideo(state.captions[idx].startTime, false);
+  } else {
+    seekVideo(t, false);
+  }
+}
+
+/** True if this caption has dub audio (own edit or covered by a continuous take). */
+function captionHasAudio(idx) {
+  const cap = state.captions[idx];
+  if (cap && cap.audioUrl) return true;
+  return findContinuousRec(idx) !== null;
+}
+
+/**
+ * Resolve the waveform source for a caption and the peak-bucket range to draw.
+ * Edit clips are stretched to fill the caption slot; continuous takes are
+ * sliced by the caption's time offset within the take.
+ */
+function captionWave(idx) {
+  const cap = state.captions[idx];
+  if (cap && cap.audioBlob && cap._wave) {
+    return { wave: cap._wave, b0: 0, b1: cap._wave.peaks.length };
+  }
+  const rec = findContinuousRec(idx);
+  if (rec && rec._wave) {
+    const takeStart = state.captions[rec.startIdx].startTime;
+    const dur = rec._wave.duration ||
+                (state.captions[rec.endIdx].endTime - takeStart) || 1;
+    const n = rec._wave.peaks.length;
+    let b0 = Math.floor(((cap.startTime - takeStart) / dur) * n);
+    let b1 = Math.ceil(((cap.endTime - takeStart) / dur) * n);
+    b0 = Math.max(0, Math.min(n - 1, b0));
+    b1 = Math.max(b0 + 1, Math.min(n, b1));
+    return { wave: rec._wave, b0, b1 };
+  }
+  return null;
+}
+
+/** Decode a blob and reduce it to a normalized peak array for drawing. */
+async function computePeaks(blob) {
+  const Ctx = window.AudioContext || window['webkitAudioContext'];
+  if (!Ctx) throw new Error('Web Audio API not supported');
+  const ctx = new Ctx();
+  try {
+    const arrayBuf = await blob.arrayBuffer();
+    const buf = await ctx.decodeAudioData(arrayBuf.slice(0));
+    const ch = buf.getChannelData(0);
+    const duration = buf.duration;
+    const buckets = Math.min(6000, Math.max(50, Math.round(duration * 200)));
+    const peaks = new Float32Array(buckets);
+    const size = ch.length / buckets;
+    let max = 0;
+    for (let b = 0; b < buckets; b++) {
+      const s = Math.floor(b * size);
+      const e = Math.min(ch.length, Math.floor((b + 1) * size));
+      let peak = 0;
+      for (let i = s; i < e; i++) {
+        const v = Math.abs(ch[i]);
+        if (v > peak) peak = v;
+      }
+      peaks[b] = peak;
+      if (peak > max) max = peak;
+    }
+    if (max > 0) for (let i = 0; i < buckets; i++) peaks[i] /= max;
+    return { peaks, duration };
+  } finally {
+    ctx.close();
+  }
+}
+
+async function buildWaveForCaption(idx) {
+  const cap = state.captions[idx];
+  if (!cap || !cap.audioBlob) return;
+  try { cap._wave = await computePeaks(cap.audioBlob); }
+  catch (e) { console.warn('Waveform build failed (caption)', e); }
+  renderTimeline();
+}
+
+async function buildWaveForContinuous(rec) {
+  if (!rec || !rec.blob) return;
+  try { rec._wave = await computePeaks(rec.blob); }
+  catch (e) { console.warn('Waveform build failed (continuous)', e); }
+  renderTimeline();
+}
+
+function fmtTimelineTime(s) {
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
+  const ss = String(sec).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  r = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawTimelineRuler(ctx, W, rulerH) {
+  const sec = tl.scrollSec;
+  const intervals = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 1800];
+  let step = intervals[intervals.length - 1];
+  for (const s of intervals) {
+    if (s * tl.pxPerSec >= 64) { step = s; break; }
+  }
+  ctx.fillStyle = 'rgba(0,0,0,0.45)';
+  ctx.font = '10px -apple-system, system-ui, sans-serif';
+  ctx.textBaseline = 'middle';
+  ctx.strokeStyle = 'rgba(0,0,0,0.08)';
+  ctx.lineWidth = 1;
+
+  const firstTick = Math.ceil(sec / step) * step;
+  for (let t = firstTick; ; t += step) {
+    const x = (t - sec) * tl.pxPerSec;
+    if (x > W) break;
+    if (x >= 0) {
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, rulerH - 6);
+      ctx.stroke();
+      ctx.fillText(fmtTimelineTime(t), x + 3, rulerH / 2);
+    }
+  }
+  ctx.beginPath();
+  ctx.moveTo(0, rulerH);
+  ctx.lineTo(W, rulerH);
+  ctx.stroke();
+}
+
+function drawTimelineWave(ctx, wsrc, x0, x1, cy, half, W) {
+  const { wave, b0, b1 } = wsrc;
+  const w = x1 - x0;
+  if (w <= 0) return;
+  const segN = b1 - b0;
+  ctx.fillStyle = '#34C759';
+  const startPx = Math.max(0, Math.floor(x0));
+  const endPx = Math.min(W, Math.ceil(x1));
+  const n = wave.peaks.length;
+  for (let px = startPx; px < endPx; px++) {
+    const frac = (px - x0) / w;
+    let bi = b0 + Math.floor(frac * segN);
+    if (bi < 0) bi = 0;
+    if (bi >= n) bi = n - 1;
+    const h = Math.max(0.6, wave.peaks[bi] * half);
+    ctx.fillRect(px, cy - h, 1, 2 * h);
+  }
+}
+
+/** Full canvas repaint: ruler, then each caption's pill + waveform. */
+function renderTimeline() {
+  const ctx = tl.ctx;
+  if (!ctx) return;
+  const W = tl.cssW, H = tl.cssH;
+  ctx.clearRect(0, 0, W, H);
+
+  const hasCaps = state.captions.length > 0;
+  if (tl.emptyEl) tl.emptyEl.classList.toggle('hidden', hasCaps);
+  if (!hasCaps) { updateTimelineScrollbar(); return; }
+
+  const rulerH = 20;
+  const pillH = 12;
+  const pad = 8;
+  const pillTop = H - pillH - pad;
+  const waveTop = rulerH + 6;
+  const waveBottom = pillTop - 6;
+  const waveCenter = (waveTop + waveBottom) / 2;
+  const halfWave = Math.max(2, (waveBottom - waveTop) / 2);
+
+  drawTimelineRuler(ctx, W, rulerH);
+
+  for (let i = 0; i < state.captions.length; i++) {
+    const cap = state.captions[i];
+    const x0 = (cap.startTime - tl.scrollSec) * tl.pxPerSec;
+    const x1 = (cap.endTime - tl.scrollSec) * tl.pxPerSec;
+    if (x1 < 0 || x0 > W) continue;
+
+    const has = captionHasAudio(i);
+    const selected = state.selectedRow === i;
+
+    // Pill
+    const px0 = Math.max(0, x0);
+    const px1 = Math.min(W, x1);
+    const pw = Math.max(2, px1 - px0);
+    roundRectPath(ctx, px0, pillTop, pw, pillH, pillH / 2);
+    ctx.fillStyle = has ? '#34C759' : 'rgba(0,0,0,0.08)';
+    ctx.fill();
+    if (selected) {
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = '#0071e3';
+      ctx.stroke();
+    }
+
+    // Waveform
+    if (has) {
+      const wsrc = captionWave(i);
+      if (wsrc) {
+        drawTimelineWave(ctx, wsrc, x0, x1, waveCenter, halfWave, W);
+      } else {
+        // Audio present but peaks not computed yet — faint placeholder line.
+        ctx.fillStyle = 'rgba(52,199,89,0.3)';
+        ctx.fillRect(px0, waveCenter - 1, pw, 2);
+      }
+    }
+  }
+
+  updateTimelineScrollbar();
+}
+
+function updateTimelineScrollbar() {
+  if (!tl.scrollbar || !tl.thumb) return;
+  const dur = tl.duration || 1;
+  const viewSec = tl.cssW / tl.pxPerSec;
+  const frac = Math.min(1, viewSec / dur);
+
+  if (frac >= 1 || !isFinite(frac)) {
+    tl.scrollbar.classList.add('disabled');
+    tl.thumb.style.width = '100%';
+    tl.thumb.style.left = '0';
+    return;
+  }
+  tl.scrollbar.classList.remove('disabled');
+  const tw = tl.scrollbar.clientWidth;
+  const thumbW = Math.max(24, tw * frac);
+  const maxLeft = tw - thumbW;
+  const left = Math.min(maxLeft, Math.max(0, (tl.scrollSec / dur) * tw));
+  tl.thumb.style.width = thumbW + 'px';
+  tl.thumb.style.left = left + 'px';
+}
+
+/** Per-frame loop: keep the playhead synced to the video and follow playback. */
+function timelineTick() {
+  tl.rafId = requestAnimationFrame(timelineTick);
+  if (!tl.ctx) return;
+
+  // Pick up the real video duration once the player reports it.
+  if (ytPlayer && typeof ytPlayer.getDuration === 'function') {
+    const d = ytPlayer.getDuration() || 0;
+    if (d > 0 && Math.abs(d - tl.videoDuration) > 0.5) {
+      tl.videoDuration = d;
+      recomputeTimelineBounds();
+      if (!tl.userZoomed) fitTimeline();
+      else { clampTimelineScroll(); renderTimeline(); }
+    }
+  }
+
+  updateTimelinePlayhead();
+  syncTimelinePlayBtn();
+}
+
+function updateTimelinePlayhead() {
+  const ph = tl.playheadEl;
+  if (!ph) return;
+  if (!ytPlayer || typeof ytPlayer.getCurrentTime !== 'function' || tl.duration <= 0) {
+    ph.classList.add('hidden');
+    return;
+  }
+  const t = ytPlayer.getCurrentTime() || 0;
+  const playing = typeof ytPlayer.getPlayerState === 'function' &&
+                  ytPlayer.getPlayerState() === 1;
+
+  // While playing, scroll to keep the playhead on screen.
+  if (playing) {
+    const x = (t - tl.scrollSec) * tl.pxPerSec;
+    if (x < 0 || x > tl.cssW) {
+      tl.scrollSec = Math.max(0, t - (tl.cssW * 0.15) / tl.pxPerSec);
+      clampTimelineScroll();
+      renderTimeline();
+    }
+  }
+
+  const x = (t - tl.scrollSec) * tl.pxPerSec;
+  if (x >= 0 && x <= tl.cssW) {
+    ph.style.left = x + 'px';
+    ph.classList.remove('hidden');
+  } else {
+    ph.classList.add('hidden');
+  }
+}
+
+// ─────────────────────────────────────────────
 // INIT — WIRE UP EVENTS
 // ─────────────────────────────────────────────
 
@@ -1969,6 +2483,7 @@ function init() {
       state.captions    = parseSRT(ev.target.result);
       state.selectedRow = null;
       renderTable();
+      fitTimeline();
       if (state.captions.length) {
         showToast(`Loaded ${state.captions.length} captions`, 'success');
       } else {
@@ -2115,6 +2630,12 @@ function init() {
     const tag = document.activeElement?.tagName;
     if (tag === 'TEXTAREA' || tag === 'INPUT') return;
 
+    if (e.key === ' ') {
+      e.preventDefault();
+      toggleVideoPlayback();
+      return;
+    }
+
     if ((e.key === 'r' || e.key === 'R') && state.selectedRow !== null && !state.isRecording) {
       e.preventDefault();
       startRecordingFrom(state.selectedRow, true);
@@ -2146,8 +2667,14 @@ function init() {
     if (e.key === '0' && state.selectedRow !== null) retranslateSelected(100);
   });
 
+  // ── Timeline play/pause button ───────────────
+  if (el.timelinePlayBtn) {
+    el.timelinePlayBtn.addEventListener('click', toggleVideoPlayback);
+  }
+
   // ── Bootstrap ───────────────────────────────
   loadYTApi();
+  initTimeline();
   loadDraft();
   updateButtons();
 }
