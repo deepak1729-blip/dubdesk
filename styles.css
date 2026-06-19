@@ -383,7 +383,7 @@ body {
 /* ==================== CAPTION PANEL ==================== */
 
 .caption-panel {
-  flex: 0 0 65%;
+  flex: 0 0 58%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
@@ -653,24 +653,31 @@ body {
 /* ==================== PLAYER PANEL ==================== */
 
 .player-panel {
-  flex: 0 0 35%;
+  flex: 0 0 42%;
   display: flex;
   flex-direction: column;
   overflow: hidden;
   background: var(--pure-black);
   padding: 14px;
+  gap: 14px;
 }
 
-.player-panel-inner {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
+/* Video area — sits on top of the right column */
+.player-video {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  max-height: 52%;
+  flex: 0 0 auto;
+  margin: 0 auto;
+  background: var(--dark-surface-1);
   border-radius: 12px;
   overflow: hidden;
 }
 
 .player-placeholder {
-  flex: 1;
+  position: absolute;
+  inset: 0;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -692,8 +699,8 @@ body {
 }
 
 .youtube-iframe-wrapper {
-  flex: 1;
-  position: relative;
+  position: absolute;
+  inset: 0;
   background: var(--pure-black);
   border-radius: 12px;
   overflow: hidden;
@@ -1014,10 +1021,7 @@ body {
   word-wrap: break-word;
 }
 .tp-word {
-  display: inline-block;
-  padding: 0 2px;
-  border-radius: 3px;
-  transition: background 0.12s ease, color 0.12s ease;
+  transition: color 0.12s ease;
 }
 .tp-word-active {
   color: var(--apple-blue);
@@ -1073,6 +1077,128 @@ body {
 .flow-word-active {
   color: var(--bright-blue);
 }
+
+/* ==================== DUB TIMELINE ==================== */
+
+.timeline-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--white);
+  border-radius: 12px;
+  overflow: hidden;
+  padding: 10px 12px;
+  gap: 8px;
+}
+
+.timeline-header {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.timeline-label {
+  font-family: var(--font-text);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  color: var(--text-tertiary);
+}
+
+.timeline-play-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--apple-blue);
+  color: var(--white);
+  font-size: 9px;
+  cursor: pointer;
+  transition: background 0.15s ease, transform 0.12s ease;
+  line-height: 1;
+}
+.timeline-play-btn:hover {
+  background: #0077ED;
+}
+.timeline-play-btn:active {
+  transform: scale(0.92);
+}
+.timeline-play-btn.playing {
+  background: var(--near-black);
+}
+
+.timeline-viewport {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  background: var(--light-gray);
+  border-radius: var(--radius);
+  overflow: hidden;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.timeline-viewport:active { cursor: grabbing; }
+
+#timeline-canvas {
+  position: absolute;
+  inset: 0;
+  display: block;
+}
+
+.timeline-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--red);
+  pointer-events: none;
+  z-index: 3;
+}
+
+.timeline-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-tertiary);
+  font-family: var(--font-text);
+  font-size: 13px;
+  letter-spacing: -0.12px;
+  pointer-events: none;
+}
+
+.timeline-scrollbar {
+  position: relative;
+  flex-shrink: 0;
+  height: 8px;
+  background: rgba(0, 0, 0, 0.05);
+  border-radius: 4px;
+}
+.timeline-scrollbar.disabled { opacity: 0.4; }
+
+.timeline-scrollbar-thumb {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 40px;
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 4px;
+  cursor: grab;
+  transition: background 0.15s ease;
+}
+.timeline-scrollbar-thumb:hover { background: rgba(0, 0, 0, 0.32); }
+.timeline-scrollbar-thumb:active { cursor: grabbing; }
+.timeline-scrollbar.disabled .timeline-scrollbar-thumb { cursor: default; }
 
 /* ==================== UTILITIES ==================== */
 
