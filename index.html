@@ -73,7 +73,7 @@
       </div>
       <button id="record-all-btn" class="btn btn-record" disabled>● Rec Continuously</button>
       <button id="stop-recording-btn" class="btn btn-stop hidden">◼ Stop</button>
-      <button id="download-all-audio-btn" class="btn btn-sub-ghost" title="Stitch all recorded audio into one file and download">⬇ All Audio</button>
+      <button id="download-all-audio-btn" class="btn btn-sub-ghost" title="Download the full dub timeline (start to end) as one MP3">⬇ All Audio</button>
       <button id="save-draft-btn" class="btn btn-sub-ghost">Save Draft</button>
       <button id="submit-btn" class="btn btn-success">Download</button>
     </div>
@@ -102,14 +102,30 @@
       </div>
     </div>
 
-    <!-- Right Column: YouTube Player -->
+    <!-- Right Column: YouTube Player + Dub Timeline -->
     <div class="player-panel">
-      <div class="player-panel-inner">
+      <div class="player-video">
         <div id="player-placeholder" class="player-placeholder">
           <div class="placeholder-icon">▶</div>
           <p>Paste a YouTube URL above<br>to load the video</p>
         </div>
         <div id="youtube-iframe-wrapper" class="youtube-iframe-wrapper hidden"></div>
+      </div>
+
+      <!-- Dub timeline: waveforms + per-caption pills -->
+      <div class="timeline-panel">
+        <div class="timeline-header">
+          <div class="timeline-label">Dub timeline</div>
+          <button id="timeline-play-btn" class="timeline-play-btn" title="Play / Pause (Space)">▶</button>
+        </div>
+        <div id="timeline-viewport" class="timeline-viewport">
+          <canvas id="timeline-canvas"></canvas>
+          <div id="timeline-playhead" class="timeline-playhead hidden"></div>
+          <div id="timeline-empty" class="timeline-empty">Upload an SRT to see the timeline</div>
+        </div>
+        <div id="timeline-scrollbar" class="timeline-scrollbar">
+          <div id="timeline-scrollbar-thumb" class="timeline-scrollbar-thumb"></div>
+        </div>
       </div>
     </div>
 
